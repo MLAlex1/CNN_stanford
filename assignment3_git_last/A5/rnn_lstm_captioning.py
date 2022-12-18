@@ -392,10 +392,6 @@ def temporal_softmax_loss(x, y, ignore_index=None):
     
     loss = nn.functional.cross_entropy(torch.transpose(x, 1, 2), y,
                           ignore_index=ignore_index, reduction='sum') / x.shape[0]
-    
-    ##########################################################################
-    #                             END OF YOUR CODE                           #
-    ##########################################################################
 
     return loss
 
@@ -465,20 +461,27 @@ class CaptioningRNN(nn.Module):
         # Replace "pass" statement with your code
         
         self.vision_model = ImageEncoder(pretrained=image_encoder_pretrained, verbose=True)#.to(device=DEVICE)
-        # self.vision_model.out_channels * 4 * 4 as shape: (B, out_channels, H / 32, W / 32)
-        self.vision_proj = nn.Linear(self.vision_model.out_channels * 4 * 4, hidden_dim)
         self.words_emb = WordEmbedding(vocab_size, wordvec_dim)
+        self.rnn_proj = nn.Linear(hidden_dim, vocab_size)
+
         
         if cell_type == 'rnn':
             self.rnn = RNN(wordvec_dim, hidden_dim)
-            self.rnn_proj = nn.Linear(hidden_dim, vocab_size)
-
-        
+            # self.vision_model.out_channels * 4 * 4 as shape: (B, out_channels, H / 32, W / 32)
+            self.vision_proj = nn.Linear(self.vision_model.out_channels * 4 * 4, hidden_dim)
+        elif cell_type == 'lstm':
+            self.rnn = LSTM(wordvec_dim, hidden_dim)
+            # self.vision_model.out_channels * 4 * 4 as shape: (B, out_channels, H / 32, W / 32)
+            self.vision_proj = nn.Linear(self.vision_model.out_channels * 4 * 4, hidden_dim)
+        elif cell_type == 'attn':
+            self.rnn = AttentionLSTM(wordvec_dim, hidden_dim)
+            self.vision_proj = nn.Linear(self.vision_model.out_channels, hidden_dim)
+            
         ######################################################################
         #                            END OF YOUR CODE                        #
         ######################################################################
 
-    def forward(self, images, captions):
+    def forward(self, images, captions, return_pred = False):
         """
         Compute training-time loss for the RNN. We input images and the GT
         captions for those images, and use an RNN (or LSTM) to compute loss. The
@@ -527,8 +530,14 @@ class CaptioningRNN(nn.Module):
 
         vision_out = self.vision_model(images) # (N, out_channels, H/32, W/32)
         N = vision_out.shape[0]
-        vision_out = vision_out.reshape(N, -1) # (N, out_channels * H/32 * W/32)
-        h0 = self.vision_proj(vision_out) # (N, H)
+        if self.cell_type == 'attn':
+            vision_out = vision_out.permute(0,2,3,1) # (N, 4, 4, out_channels)
+            # projected activation, which is the weight that affects attention weights. 
+            # In other words, this is the learnable weight that influences attention.
+            h0 = self.vision_proj(vision_out).permute(0,3,1,2) # (N, 4, 4, H) -> permute -> (N, H, 4, 4)
+        else:
+            vision_out = vision_out.reshape(N, -1) # (N, out_channels * H/32 * W/32)
+            h0 = self.vision_proj(vision_out) # (N, H)
         
         embs_in = self.words_emb(captions_in) # (N, T, W)
         rnn_out = self.rnn(embs_in, h0).float() # (N, T, H)
@@ -539,7 +548,8 @@ class CaptioningRNN(nn.Module):
         ######################################################################
         #                           END OF YOUR CODE                         #
         ######################################################################
-
+        if return_pred:
+            return rnn_out, captions_out, loss
         return loss
 
     def sample(self, images, max_length=15):
@@ -598,28 +608,61 @@ class CaptioningRNN(nn.Module):
         #######################################################################
         # Replace "pass" statement with your code
         
-        vision_out = self.vision_model(images) # (N, out_channels, H/32, W/32)
-        vision_out = vision_out.reshape(N, -1) # (N, out_channels * H/32 * W/32)
-        next_h = self.vision_proj(vision_out) # (N, H)
+        
         
         captions[:, 0] = self._start
         # print(captions.shape)
         
-        for i in range(max_length-1):
-            embs = self.words_emb(captions[:, i])
-            # print(embs.shape)
-            # print(next_h.shape)
-            next_h = self.rnn.step_forward(embs, next_h).float()
-            rnn_out = self.rnn_proj(next_h) # (N, T, W)
-            # print(rnn_out.argmax(-1))
-            idxs = rnn_out.argmax(-1)
-            captions[:, i+1] = idxs
-            # print(captions)
-        
-        
-        ######################################################################
-        #                           END OF YOUR CODE                         #
-        ######################################################################
+        if self.cell_type == 'rnn':
+            vision_out = self.vision_model(images) # (N, out_channels, H/32, W/32)
+            vision_out = vision_out.reshape(N, -1) # (N, out_channels * H/32 * W/32)
+            next_h = self.vision_proj(vision_out) # (N, H)
+            _, H = next_h.shape
+            for i in range(max_length-1):
+                embs = self.words_emb(captions[:, i])
+                # print(embs.shape)
+                # print(next_h.shape)
+                next_h = self.rnn.step_forward(embs, next_h).float()
+                rnn_out = self.rnn_proj(next_h) # (N, T, W)
+                # print(rnn_out.argmax(-1))
+                idxs = rnn_out.argmax(-1)
+                captions[:, i+1] = idxs
+                # print(captions)
+        elif self.cell_type == 'lstm':
+            vision_out = self.vision_model(images) # (N, out_channels, H/32, W/32)
+            vision_out = vision_out.reshape(N, -1) # (N, out_channels * H/32 * W/32)
+            next_h = self.vision_proj(vision_out) # (N, H)
+            _, H = next_h.shape
+            next_c = torch.zeros((N, H))
+            for i in range(max_length-1):
+                embs = self.words_emb(captions[:, i])
+                # print(embs.shape)
+                # print(next_h.shape)
+                next_h, next_c = self.rnn.step_forward(embs, next_h, next_c)
+                next_h = next_h.float()
+                next_c = next_c.float()
+                rnn_out = self.rnn_proj(next_h) # (N, T, W)
+                # print(rnn_out.argmax(-1))
+                idxs = rnn_out.argmax(-1)
+                captions[:, i+1] = idxs
+        elif self.cell_type == 'attn':
+            vision_out = self.vision_model(images) # (N, out_channels, H/32, W/32)
+            vision_out = vision_out.permute(0,2,3,1)
+            A = self.vision_proj(vision_out).permute(0,3,1,2)
+            next_h = A.mean(dim=(2, 3))
+            next_c = prev_h = prev_c = next_h  
+            for i in range(max_length-1):
+                embs = self.words_emb(captions[:, i])
+                attn, attn_weights = dot_product_attention(prev_h, A)
+                next_h, next_c = self.rnn.step_forward(embs, next_h, next_c, attn)
+                prev_h = next_h
+                prev_c = next_c
+                rnn_out = self.rnn_proj(next_h) # (N, T, W)
+                idxs = rnn_out.argmax(-1)
+                captions[:, i+1] = idxs
+                attn_weights_all[:, i+1] = attn_weights
+                
+
         if self.cell_type == "attn":
             return captions, attn_weights_all.cpu()
         else:
@@ -686,9 +729,7 @@ class LSTM(nn.Module):
         g = torch.tanh(ag)
         next_c = f * prev_c + i * g
         next_h = o * torch.tanh(next_c)
-        ######################################################################
-        #                           END OF YOUR CODE                         #
-        ######################################################################
+
         return next_h, next_c
 
     def forward(self, x: torch.Tensor, h0: torch.Tensor) -> torch.Tensor:
@@ -731,9 +772,7 @@ class LSTM(nn.Module):
                 next_h, next_c = self.step_forward(xt, next_h, next_c)   
 
             h[:, t, :] = next_h 
-        ######################################################################
-        #                           END OF YOUR CODE                         #
-        ######################################################################
+
         hn = h
         return hn
 
@@ -761,10 +800,14 @@ def dot_product_attention(prev_h, A):
     # functions. HINT: Make sure you reshape attn_weights back to (N, 4, 4)! #
     ##########################################################################
     # Replace "pass" statement with your code
-    pass
-    ##########################################################################
-    #                             END OF YOUR CODE                           #
-    ##########################################################################
+    
+    A_tild = A.reshape(N, -1, D_a ** 2)
+    attn_raw = (prev_h.unsqueeze(2).permute(0, 2, 1) @ A_tild) / math.sqrt(H)
+    attn_weights = torch.softmax(attn_raw, dim=-1)
+    
+    attn = A_tild @ attn_weights.permute(0,2,1)
+    attn = attn.squeeze()
+    attn_weights = attn_weights.view(N, D_a, D_a)
 
     return attn, attn_weights
 
@@ -825,10 +868,16 @@ class AttentionLSTM(nn.Module):
         #######################################################################
         next_h, next_c = None, None
         # Replace "pass" statement with your code
-        pass
-        ######################################################################
-        #                           END OF YOUR CODE                         #
-        ######################################################################
+        h = x @ self.Wx + prev_h @ self.Wh + attn @ self.Wattn + self.b
+        assert h.shape[-1] % 4 == 0
+        ai, af, ao, ag = torch.tensor_split(h, 4, dim=-1)
+        i = torch.sigmoid(ai)
+        f = torch.sigmoid(af)
+        o = torch.sigmoid(ao)
+        g = torch.tanh(ag)
+        next_c = f * prev_c + i * g
+        next_h = o * torch.tanh(next_c)
+ 
         return next_h, next_c
 
     def forward(self, x: torch.Tensor, A: torch.Tensor):
@@ -860,16 +909,24 @@ class AttentionLSTM(nn.Module):
         # we provided them for you.
         h0 = A.mean(dim=(2, 3))  # Initial hidden state, of shape (N, H)
         c0 = h0  # Initial cell state, of shape (N, H)
+        N, T, _ = x.shape
+        H = h0.shape[-1]
 
         ######################################################################
         # TODO: Implement the forward pass for an LSTM over an entire time-  #
         # series. You should use the `dot_product_attention` function that   #
         # is defined outside this module.                                    #
         ######################################################################
-        hn = None
+        hn = torch.zeros(N, T, H)
         # Replace "pass" statement with your code
-        pass
-        ######################################################################
-        #                           END OF YOUR CODE                         #
-        ######################################################################
+        
+        prev_h = h0
+        prev_c = c0
+        for t in range(x.shape[1]):
+            attn, attn_weights = dot_product_attention(prev_h, A)
+            next_h, next_c = self.step_forward(x[:, t, :], prev_h, prev_c, attn)
+            prev_h = next_h
+            prev_c = next_c
+            hn[:, t, :] = next_h
+    
         return hn
