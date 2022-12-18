@@ -183,6 +183,8 @@ def attention_visualizer(img, attn_weights, token):
     # Combine image and attention map
     img_copy = img.float().div(255.0).permute(1, 2, 0).numpy()[:, :, ::-1].copy()
     masked_img = cv2.addWeighted(attn_weights, 0.5, img_copy, 0.5, 0)
+    # we concatenate just for the black background above the image to write the word
+    # we are decoding
     img_copy = np.concatenate((np.zeros((25, W, 3)), masked_img), axis=0)
 
     # Add text
