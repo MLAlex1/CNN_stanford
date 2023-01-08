@@ -35,7 +35,7 @@ class DetectorBackboneWithFPN(nn.Module):
     backbone that can work with Colab GPU and get decent enough performance.
     """
 
-    def __init__(self, out_channels: int, first_method=False):
+    def __init__(self, out_channels: int, first_method=True):
         super().__init__()
         self.out_channels = out_channels
 
@@ -84,8 +84,8 @@ class DetectorBackboneWithFPN(nn.Module):
         # This behaves like a Python dict, but makes PyTorch understand that
         # there are trainable weights inside it.
         # Add THREE lateral 1x1 conv and THREE output 3x3 conv layers.
+        
         self.fpn_params = nn.ModuleDict()
-        # first_cout = ['conv5', 'conv4
         if self.first_method:
             s = 1
             f = 1
@@ -101,15 +101,13 @@ class DetectorBackboneWithFPN(nn.Module):
                 ph = int(np.ceil(((s-1)*h-s+f)/2))
                 self.fpn_params[p_name] = nn.Conv2d(out_channels, out_channels, kernel_size=f, padding=(pw, ph), stride=s)
         else:
-            # HREE "lateral" 1x1 conv layers to transform (c3, c4, c5) such that they all end up with the same `out_channels`. 
-            self.fpn_params['conv3'] = nn.Conv2d(dummy_out['c3'].shape[1], self.out_channels, 1)
-            self.fpn_params['conv4'] = nn.Conv2d(dummy_out['c4'].shape[1], self.out_channels, 1)
             self.fpn_params['conv5'] = nn.Conv2d(dummy_out['c5'].shape[1], self.out_channels, 1)
-            
-            # THREE "output" 3x3 conv layers to transform the merged FPN features to output (p3, p4, p5) features.
-            self.fpn_params['conv_out3'] = nn.Conv2d(self.out_channels, self.out_channels, 3, stride=1, padding=1)
-            self.fpn_params['conv_out4'] = nn.Conv2d(self.out_channels, self.out_channels, 3, stride=1, padding=1)
+            self.fpn_params['conv4'] = nn.Conv2d(dummy_out['c4'].shape[1], self.out_channels, 1)
+            self.fpn_params['conv3'] = nn.Conv2d(dummy_out['c3'].shape[1], self.out_channels, 1)
+
             self.fpn_params['conv_out5'] = nn.Conv2d(self.out_channels, self.out_channels, 3, stride=1, padding=1)
+            self.fpn_params['conv_out4'] = nn.Conv2d(self.out_channels, self.out_channels, 3, stride=1, padding=1)
+            self.fpn_params['conv_out3'] = nn.Conv2d(self.out_channels, self.out_channels, 3, stride=1, padding=1)
 
     @property
     def fpn_strides(self):
@@ -144,13 +142,27 @@ class DetectorBackboneWithFPN(nn.Module):
                 
         else:
             c5 = backbone_feats["c5"]; c4 = backbone_feats["c4"]; c3 = backbone_feats["c3"]
+            # https://jonathan-hui.medium.com/understanding-feature-pyramid-networks-for-object-detection-fpn-45b227b9106c
+            # Remember that c3 contains has higher resolution than c5 (higher resolution - we can more easily recognise smaller objects,
+            # howver it's slower because bigger image thus they are not used for object prediction because of the speed)
+            # but c5 has a higher semantic value, even though low resolution but because it's quicker to predict on them they are used 
+            # for object detection. 
+            # F.interpolate is used for upsampling - this is to reconstruct higher resolution layers (downsampled layers have low resolution)
+            # from a semantic rich layer (deeper layers). The reconstructed layers are semantic strong but the locations of objects are not 
+            # precise after all the downsampling and upsampling. We add lateral connections between reconstructed layers and the corresponding 
+            # feature maps to help the detector to predict the location betters. It also acts as skip connections to make training easier
             
-            # we merge FPN features by summing them
+            # We apply a 1×1 convolution filter to reduce C5 channel depth to 256-d to create an intermediate layer (out5). This becomes the first feature map 
+            # layer used for object prediction. As we go down the top-down path, we upsample the previous layer by 2 using nearest neighbors upsampling (F.interpolate(out5, scale_factor=2)).
+            # We again apply a 1×1 convolution to the corresponding feature maps in the bottom-up pathway (self.fpn_params['conv4'](c4)). 
+            # Then we add them element-wise (F.interpolate(out5, scale_factor=2) + self.fpn_params['conv4'](c4)). 
+            # We apply a 3×3 convolution to all merged layers (self.fpn_params['conv_out5'](out5), self.fpn_params['conv_out4'](out4), self.fpn_params['conv_out3'](out3)). 
+            # This filter reduces the aliasing effect when merged with the upsampled layer.
             out5 = self.fpn_params['conv5'](c5)
+                   # reconstructed layer + corresponding feature maps
             out4 = F.interpolate(out5, scale_factor=2) + self.fpn_params['conv4'](c4)
             out3 = F.interpolate(out4, scale_factor=2) + self.fpn_params['conv3'](c3)
             
-            # transform merged FPN features
             fpn_feats["p5"] = self.fpn_params['conv_out5'](out5)
             fpn_feats["p4"] = self.fpn_params['conv_out4'](out4)
             fpn_feats["p3"] = self.fpn_params['conv_out3'](out3)
@@ -188,7 +200,11 @@ def get_fpn_location_coords(
     location_coords = {
         level_name: None for level_name, _ in shape_per_fpn_level.items()
     }
-        
+    
+    # RESULTS DIFFERENt BETWEEN MINE AND 
+    # https://github.com/strickland0702/EECS598-008-DLCV/blob/f095a31626f720fcb02503442dfc97eddc54025f/A4/one_stage_detector.ipynb
+    # as rows and cols seem inverted. Need more testing
+    
     # same but in for loop fashion
     # temp = torch.zeros(H, W, 2)
     # level_stride = 8
@@ -216,14 +232,69 @@ def get_fpn_location_coords(
 
         final = torch.stack([rows, cols], -1).squeeze()
         location_coords[level_name] = final
-        ######################################################################
-        # TODO: Implement logic to get location co-ordinates below.          #
-        ######################################################################
-        
-        
+    
+#     for level_name, feat_shape in shape_per_fpn_level.items():
+#         level_stride = strides_per_fpn_level[level_name]
+
+#         # location_coords[level_name] = temp.flatten(end_dim=1)
+#         rows = level_stride * (torch.arange(feat_shape[2], dtype=dtype, device=device) + 0.5)
+#         rows = rows.expand(feat_shape[2], feat_shape[3]).t()
+#         cols = level_stride * (torch.arange(feat_shape[3], dtype=dtype, device=device) + 0.5)
+#         cols = cols.expand(feat_shape[2], feat_shape[3])
+#         location_coords[level_name] = torch.stack((cols, rows), dim=2).flatten(end_dim=1)
         
     return location_coords
 
+
+def IoU(proposals, bboxes):
+    """
+    Compute intersection over union between sets of bounding boxes.
+
+    Inputs:
+    - proposals: Proposals of shape (B, A, H', W', 4)
+    - bboxes: Ground-truth boxes from the DataLoader of shape (B, N, 5).
+    Each ground-truth box is represented as tuple (x_lr, y_lr, x_rb, y_rb, class).
+    If image i has fewer than N boxes, then bboxes[i] will be padded with extra
+    rows of -1.
+
+    Outputs:
+    - iou_mat: IoU matrix of shape (B, A*H'*W', N) where iou_mat[b, i, n] gives
+    the IoU between one element of proposals[b] and bboxes[b, n].
+
+    For this implementation you DO NOT need to filter invalid proposals or boxes;
+    in particular you don't need any special handling for bboxxes that are padded
+    with -1.
+    """
+    (_, N, _) = bboxes.size()
+    (B, A, H, W, _) = proposals.size()
+    # iou_mat = torch.zeros(B, A*H*W, N)
+    iou_mat = torch.zeros((B,A*H*W,N),device=proposals.device)*-1
+    ##############################################################################
+    # TODO: Compute the Intersection over Union (IoU) on proposals and GT boxes. #
+    # No need to filter invalid proposals/bboxes (i.e., allow region area <= 0). #
+    # You need to ensure your implementation is efficient (no for loops).        #
+    # HINT:                                                                      #
+    # IoU = Area of Intersection / Area of Union, where
+    # Area of Union = Area of Proposal + Area of BBox - Area of Intersection     #
+    # and the Area of Intersection can be computed using the top-left corner and #
+    # bottom-right corner of proposal and bbox. Think about their relationships. #
+    ##############################################################################
+    # Replace "pass" statement with your code
+
+    proposals = proposals.reshape(B,A*H*W,4)
+    proposals = proposals.unsqueeze(2).repeat(1,1,N,1)
+
+    max_x1 = torch.max(proposals[:,:,:,0],bboxes[:,:,0].unsqueeze(1))
+    max_y1 = torch.max(proposals[:,:,:,1],bboxes[:,:,1].unsqueeze(1))
+    min_x2 = torch.min(proposals[:,:,:,2],bboxes[:,:,2].unsqueeze(1))
+    min_y2 = torch.min(proposals[:,:,:,3],bboxes[:,:,3].unsqueeze(1))
+    intersection_area = torch.clamp(min_x2-max_x1,min=0) * torch.clamp(min_y2-max_y1,min=0)
+
+    Area1=(bboxes[:,:,2]-bboxes[:,:,0])*(bboxes[:,:,3]-bboxes[:,:,1])
+    Area2=(proposals[:,:,:,2]-proposals[:,:,:,0])*(proposals[:,:,:,3]-proposals[:,:,:,1])
+
+    iou_mat = intersection_area/(Area1.unsqueeze(1)+Area2-intersection_area)
+    return iou_mat
 
 def nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float = 0.5):
     """
@@ -256,11 +327,31 @@ def nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float = 0.5):
     # HINT: You can refer to the torchvision library code:                      #
     # github.com/pytorch/vision/blob/main/torchvision/csrc/ops/cpu/nms_kernel.cpp
     #############################################################################
-    # Replace "pass" statement with your code
-    pass
-    #############################################################################
-    #                              END OF YOUR CODE                             #
-    #############################################################################
+    
+    _, idx_sort = scores.sort(descending=True)
+    box_sort = boxes[idx_sort]
+    idxs = []
+    
+    while len(box_sort) != 0:
+        highest_box = box_sort[0]
+        idx = idx_sort[0]
+        idxs.append(idx)
+        
+        box_sort = box_sort[1:, :]
+        idx_sort = idx_sort[1:]
+        to_remove = []
+        
+        # compute IoU between highest scoring box and other boxes
+        # we need (B, A, H', W', 4) and  (B, N, 5) shapes for IoU function
+        iou_scores = IoU(box_sort.reshape(1, 1, 1, -1, 4), highest_box.reshape(1, 1, -1)).flatten().numpy().astype(float)        
+        # remove indices where highest box overlaps with other remaining boxes 
+        # with threshold > iou_threshold
+        to_remove_idxs = ~(iou_scores > iou_threshold)
+        box_sort = box_sort[to_remove_idxs]
+        idx_sort = idx_sort[to_remove_idxs]
+        
+    keep = torch.Tensor(idxs).long()
+        
     return keep
 
 

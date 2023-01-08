@@ -7,6 +7,7 @@ from a4_helper import *
 from common import class_spec_nms, get_fpn_location_coords, nms
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.data._utils.collate import default_collate
 
 # Short hand type notation:
 TensorDict = Dict[str, torch.Tensor]
@@ -60,8 +61,16 @@ class RPNPredictionNetwork(nn.Module):
         # Fill this list. It is okay to use your implementation from
         # `FCOSPredictionNetwork` for this code block.
         stem_rpn = []
-        # Replace "pass" statement with your code
-        pass
+        
+        in_channel_temp = in_channels
+        for stem in stem_channels:
+            # padding = 1 as (f-1)/2 = 1
+            self.rpn_conv1 = nn.Conv2d(in_channel_temp, stem, kernel_size=3, stride=1, padding=1)
+            nn.init.normal_(self.rpn_conv1.weight.data, mean=0, std=0.01)
+            nn.init.constant_(self.rpn_conv1.bias.data, 0)
+            stem_rpn.append(self.rpn_conv1)
+            stem_rpn.append(nn.ReLU())
+            in_channel_temp = stem
 
         # Wrap the layers defined by student into a `nn.Sequential` module:
         self.stem_rpn = nn.Sequential(*stem_rpn)
@@ -74,15 +83,15 @@ class RPNPredictionNetwork(nn.Module):
         # numerically stable implementations with logits.
         ######################################################################
 
-        # Replace these lines with your code, keep variable names unchanged.
-        self.pred_obj = None  # Objectness conv
-        self.pred_box = None  # Box regression conv
+        # objectness and box deltas for every anchor, at every location.
+        self.pred_obj = nn.Conv2d(stem_channels[-1], 1 * self.num_anchors, kernel_size=1)
+        nn.init.normal_(self.pred_obj.weight.data, mean=0.0, std=0.01)
+        nn.init.constant_(self.pred_obj.bias.data, 0)
+        
+        self.pred_box = nn.Conv2d(stem_channels[-1], 4 * self.num_anchors, kernel_size=1)
+        nn.init.normal_(self.pred_box.weight.data, mean=0.0, std=0.01)
+        nn.init.constant_(self.pred_box.bias.data, 0)
 
-        # Replace "pass" statement with your code
-        pass
-        ######################################################################
-        #                           END OF YOUR CODE                         #
-        ######################################################################
 
     def forward(self, feats_per_fpn_level: TensorDict) -> List[TensorDict]:
         """
@@ -109,13 +118,17 @@ class RPNPredictionNetwork(nn.Module):
         # Fill these with keys: {"p3", "p4", "p5"}, same as input dictionary.
         object_logits = {}
         boxreg_deltas = {}
-
-        # Replace "pass" statement with your code
-        pass
-        ######################################################################
-        #                           END OF YOUR CODE                         #
-        ######################################################################
-
+        
+        for p in feats_per_fpn_level:
+            stem_out = self.stem_rpn(feats_per_fpn_level[p])
+            box_pred = self.pred_box(stem_out) # (b, a*4, H, W)
+            b, _, H, W = box_pred.shape
+            box_pred = box_pred.permute(0, 2, 3, 1).reshape(b, self.num_anchors * H * W, 4)
+            boxreg_deltas[p] = box_pred
+            obj_pred = self.pred_obj(stem_out)
+            object_logits[p] = obj_pred.view(b, -1)
+        
+        
         return [object_logits, boxreg_deltas]
 
 
@@ -176,11 +189,14 @@ def generate_fpn_anchors(
             # `stride_scale` and `aspect_ratios` definitions. Then shift the
             # locations to get top-left and bottom-right co-ordinates.
             ##################################################################
-            # Replace "pass" statement with your code
-            pass
-            ##################################################################
-            #                           END OF YOUR CODE                     #
-            ##################################################################
+            # compute new height and width of anchors
+            area = (stride_scale * level_stride) ** 2
+            new_width = math.sqrt(area/aspect_ratio)
+            new_height = area/new_width
+            xc, yc = locations.unsqueeze(1).unbind(-1)
+            # derive anchors coordinates starting from centers 
+            new_anchors = torch.cat([xc - new_width/2, yc - new_height/2, xc + new_width/2, yc + new_height/2], dim=-1) 
+            anchor_boxes.append(new_anchors)
 
         # shape: (A, H * W, 4)
         anchor_boxes = torch.stack(anchor_boxes)
@@ -210,11 +226,23 @@ def iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
     ##########################################################################
     # TODO: Implement the IoU function here.                                 #
     ##########################################################################
-    # Replace "pass" statement with your code
-    pass
-    ##########################################################################
-    #                             END OF YOUR CODE                           #
-    ##########################################################################
+    
+    # we need to compare each box with each box, thus we need to unsqueeze on dim 1
+    max_x1 = torch.max(boxes1[:, 0].unsqueeze(1), boxes2[:, 0])
+    max_y1 = torch.max(boxes1[:, 1].unsqueeze(1), boxes2[:, 1])
+    min_x2 = torch.min(boxes1[:, 2].unsqueeze(1), boxes2[:, 2])
+    min_y2 = torch.min(boxes1[:, 3].unsqueeze(1), boxes2[:, 3])
+
+    # clip to avoid negative values here - happens when there is no intersection
+    # between two boxes
+    x_coords = torch.clip(min_x2 - max_x1, min=0)
+    y_coords = torch.clip(min_y2 - max_y1, min=0)
+    intersection = x_coords * y_coords
+    area1 = (boxes1[:, 2:4] - boxes1[:, :2]).prod(1)
+    area2 = (boxes2[:, 2:4] - boxes2[:, :2]).prod(1)
+    
+    iou = intersection/(area1.unsqueeze(1) + area2 - intersection)
+    
     return iou
 
 
@@ -240,6 +268,10 @@ def rcnn_match_anchors_to_gt(
             codebase, this tensor is directly served by the dataloader.
         iou_thresholds: Tuple of (low, high) IoU thresholds, both in [0, 1]
             giving thresholds to assign foreground/background anchors.
+    Returns:
+        tensor of shape `(N, 4)` - so matching all anchors with a GT 
+        box (or -1/-1e8 in case of background/neutral)
+        
     """
 
     # Filter empty GT boxes:
@@ -297,12 +329,31 @@ def rcnn_get_deltas_from_anchors(
     # Remember to set the deltas of "background/neutral" GT boxes to -1e8    #
     ##########################################################################
     deltas = None
-    # Replace "pass" statement with your code
-    pass
-    ##########################################################################
-    #                             END OF YOUR CODE                           #
-    ##########################################################################
-
+    
+    # width and height proposals
+    pw, ph = (anchors[:, 2:] - anchors[:, :2]).unbind(dim=1)
+    # center proposals
+    px, py = (anchors[:, 0] + pw/2), (anchors[:, 3] - ph/2)
+    
+    # width and height gt
+    bw, bh = (gt_boxes[:, 2:4] - gt_boxes[:, :2]).unbind(dim=1)
+    # center gt
+    bx, by = (gt_boxes[:, 0] + bw/2), (gt_boxes[:, 3] - bh/2)
+        
+    tx = (bx - px)/pw; ty = (by - py)/ph
+    tw = torch.log(bw/pw); th = torch.log(bh/ph)
+    
+    deltas = torch.cat([tx.unsqueeze(1),
+                        ty.unsqueeze(1), 
+                        tw.unsqueeze(1), 
+                        th.unsqueeze(1)],
+                       dim=1)
+    
+    # background is -1, neutral is -1e8 thus
+    # < 0 should work
+    mask = (gt_boxes[:, -1] < 0)
+    deltas[mask] = -1e8
+    
     return deltas
 
 
@@ -330,13 +381,30 @@ def rcnn_apply_deltas_to_anchors(
 
     ##########################################################################
     # TODO: Implement the transformation logic to get output boxes.          #
-    ##########################################################################
-    output_boxes = None
-    # Replace "pass" statement with your code
-    pass
-    ##########################################################################
-    #                             END OF YOUR CODE                           #
-    ##########################################################################
+    ##########################################################################    
+    tx, ty, tw, th = deltas.unbind(dim=1)
+    # width and height proposals
+    pw, ph = (anchors[:, 2:] - anchors[:, :2]).unbind(dim=1)
+    # center proposals
+    px, py = (anchors[:, 0] + pw/2), (anchors[:, 3] - ph/2)
+    
+    bx = px + pw*tx; by = py + ph*ty;
+    bw = pw * torch.exp(tw); bh = ph * torch.exp(th);
+    
+    # we need to output the box coordinates, not centers
+    # and width/height!
+    x1 = bx - bw/2; y1 = by - bh/2;
+    x2 = bx + bw/2; y2 = by + bh/2;
+    output_boxes = torch.cat([x1.unsqueeze(1),
+                              y1.unsqueeze(1), 
+                              x2.unsqueeze(1),
+                              y2.unsqueeze(1)], dim=1)
+    
+    # deltas with values -1e8 is background or neutral
+    # (see rcnn_get_deltas_from_anchors)
+    mask = (deltas[:, -1] < -1e7)
+    output_boxes[mask] = -1e8 
+
     return output_boxes
 
 
@@ -503,12 +571,22 @@ class RPN(nn.Module):
             None,
             None,
         )
-        # Replace "pass" statement with your code
-        pass
-        ######################################################################
-        #                           END OF YOUR CODE                         #
-        ######################################################################
-
+        
+        pred_obj_logits, pred_boxreg_deltas = self.pred_net(feats_per_fpn_level)
+        shape_per_fpn_level = {l : feats_per_fpn_level[l].shape for l in feats_per_fpn_level}
+        locations = get_fpn_location_coords(
+            shape_per_fpn_level=shape_per_fpn_level,
+            strides_per_fpn_level=strides_per_fpn_level
+        )
+        
+        # Generate anchors for these locations.
+        anchors_per_fpn_level = generate_fpn_anchors(
+            locations_per_fpn_level=locations,
+            strides_per_fpn_level=strides_per_fpn_level,
+            stride_scale=self.anchor_stride_scale,  # Default value used by Faster R-CNN
+            aspect_ratios=self.anchor_aspect_ratios # same as number of anchors
+        )
+        
         # We will fill three values in this output dict - "proposals",
         # "loss_rpn_box" (training only), "loss_rpn_obj" (training only)
         output_dict = {}
@@ -544,10 +622,12 @@ class RPN(nn.Module):
         # giving matching GT boxes to anchor boxes). Fill this list:
         matched_gt_boxes = []
         # Replace "pass" statement with your code
-        pass
-        ######################################################################
-        #                           END OF YOUR CODE                         #
-        ######################################################################
+        for b in range(num_images):
+            # anchor_boxes_img = anchor_boxes[b]
+            gt_boxes_img = gt_boxes[b]
+            # for each anchor, what's the corresponding object with highest IoU
+            match_gt_boxes_img = rcnn_match_anchors_to_gt(anchor_boxes, gt_boxes_img, self.anchor_iou_thresholds)
+            matched_gt_boxes.append(match_gt_boxes_img)
 
         # Combine matched boxes from all images to a `(B, HWA, 5)` tensor.
         matched_gt_boxes = torch.stack(matched_gt_boxes, dim=0)
@@ -584,11 +664,22 @@ class RPN(nn.Module):
             ##################################################################
             # Feel free to delete this line: (but keep variable names same)
             loss_obj, loss_box = None, None
-            # Replace "pass" statement with your code
-            pass
-            ##################################################################
-            #                         END OF YOUR CODE                       #
-            ##################################################################
+            
+            # step 1
+            fg_idx, bg_idx = sample_rpn_training(matched_gt_boxes, num_images * self.batch_size_per_image, 0.5)
+            selected_anchor_boxes = torch.cat((anchor_boxes[fg_idx], anchor_boxes[bg_idx]), dim=0)
+            selected_gt_boxes = torch.cat((matched_gt_boxes[fg_idx], matched_gt_boxes[bg_idx]), dim=0)
+            selected_boxreg_deltas = torch.cat((pred_boxreg_deltas[fg_idx], pred_boxreg_deltas[bg_idx]), dim=0)
+            selected_obj_logits = torch.cat((pred_obj_logits[fg_idx], pred_obj_logits[bg_idx]), dim = 0)
+            # step 2
+            gt_deltas = rcnn_get_deltas_from_anchors(selected_anchor_boxes, selected_gt_boxes)
+
+            # step 3
+            loss_box = F.l1_loss(selected_boxreg_deltas, gt_deltas, reduction="none")
+            loss_box[gt_deltas == -1e8] *= 0.0
+
+            loss_obj = F.binary_cross_entropy_with_logits(selected_obj_logits.view(-1), 
+                                                          torch.where(selected_gt_boxes[:, -1] >= 0, 1, 0).to(torch.float32), reduction="none")
 
             # Sum losses and average by num(foreground + background) anchors.
             # In training code, we simply add these two and call `.backward()`
@@ -617,7 +708,8 @@ class RPN(nn.Module):
                     XYXY co-ordinates of predicted proposals. These will serve
                     as anchor boxes for the second stage.
         """
-
+        
+        img_width, img_height = image_size
         # Gather proposals from all FPN levels in this list.
         proposals_all_levels = {
             level_name: None for level_name, _ in anchors_per_fpn_level.items()
@@ -652,12 +744,35 @@ class RPN(nn.Module):
                 # Note that deltas, anchor boxes, and objectness logits have
                 # different shapes, you need to make some intermediate views.
                 ##############################################################
-                # Replace "pass" statement with your code
-                pass
-                ##############################################################
-                #                        END OF YOUR CODE                    #
-                ##############################################################
-
+                lvl_object_logits = level_obj_logits[_batch_idx]
+                lvl_boxreg_deltas = level_boxreg_deltas[_batch_idx]
+                # from predicted deltas to proposals
+                proposal_boxes = rcnn_apply_deltas_to_anchors(lvl_boxreg_deltas, level_anchors)
+                proposal_boxes[:, 0] = torch.clamp(proposal_boxes[:, 0], min=0) 
+                proposal_boxes[:, 1] = torch.clamp(proposal_boxes[:, 1], max=img_width) 
+                proposal_boxes[:, 2] = torch.clamp(proposal_boxes[:, 2], min=0) 
+                proposal_boxes[:, 3] = torch.clamp(proposal_boxes[:, 3], max=img_height) 
+                
+                if lvl_object_logits.numel() > self.pre_nms_topk:
+                    obj_values, indices = torch.topk(lvl_object_logits, self.pre_nms_topk)
+                    proposal_boxes = proposal_boxes[indices]
+                    lvl_object_logits = lvl_object_logits[indices]
+                # obj_values, obj_indices = lvl_object_logits.sort(descending=True)
+                # proposal_boxes = proposal_boxes[obj_indices[:self.pre_nms_topk]]
+                # lvl_object_logits = lvl_object_logits[obj_indices[:self.pre_nms_topk]]
+                
+                keep = torchvision.ops.nms(proposal_boxes, lvl_object_logits, iou_threshold=self.nms_thresh)
+                proposal_boxes = proposal_boxes[keep]
+                lvl_object_logits = lvl_object_logits[keep]
+                
+                if lvl_object_logits.numel() > self.post_nms_topk:
+                    obj_values, indices = torch.topk(lvl_object_logits, self.post_nms_topk)
+                    proposal_boxes = proposal_boxes[indices]
+                    lvl_object_logits = lvl_object_logits[indices]
+                
+                level_proposals_per_image.append(proposal_boxes)
+                
+                
             # Collate proposals from individual images. Do not stack these
             # tensors, they may have different shapes since few images or
             # levels may have less than `post_nms_topk` proposals. We could
@@ -665,7 +780,8 @@ class RPN(nn.Module):
             # `torchvision.ops.roi_align` in second stage which operates
             # with lists, not batched tensors.
             proposals_all_levels[level_name] = level_proposals_per_image
-
+        
+        # proposals_all_levels = default_collate(proposals_all_levels)
         return proposals_all_levels
 
     @staticmethod
@@ -719,7 +835,15 @@ class FasterRCNN(nn.Module):
         # `FCOSPredictionNetwork` for this code block.
         cls_pred = []
         # Replace "pass" statement with your code
-        pass
+        in_channel_temp = self.backbone.out_channels
+        for stem in stem_channels:
+            # padding = 1 as (f-1)/2 = 1
+            conv = nn.Conv2d(in_channel_temp, stem, kernel_size=3, stride=1, padding=1)
+            nn.init.normal_(conv.weight.data, mean=0, std=0.01)
+            nn.init.constant_(conv.bias.data, 0)
+            cls_pred.append(conv)
+            cls_pred.append(nn.ReLU())
+            in_channel_temp = stem
 
         ######################################################################
         # TODO: Add an `nn.Flatten` module to `cls_pred`, followed by a linear
@@ -728,10 +852,12 @@ class FasterRCNN(nn.Module):
         # shape from `nn.Flatten` layer.
         ######################################################################
         # Replace "pass" statement with your code
-        pass
-        ######################################################################
-        #                           END OF YOUR CODE                         #
-        ######################################################################
+        # Flatten starts from dim=1, NOT from batch dim!
+        cls_pred.append(nn.Flatten())
+        # output from here is (b, stem_channels[-1], 7, 7)
+        # so Linear layer should be stem_channels[-1] * 7 * 7
+        cls_pred.append(nn.Linear(stem * roi_size[0] * roi_size[1], num_classes + 1))
+        
 
         # Wrap the layers defined by student into a `nn.Sequential` module,
         # Faster R-CNN also predicts box offsets to "refine" RPN proposals, we
@@ -753,6 +879,10 @@ class FasterRCNN(nn.Module):
         output_dict = self.rpn(
             feats_per_fpn_level, self.backbone.fpn_strides, gt_boxes
         )
+        
+        # these proposals are a dictionary of lists. Each list
+        # corresponds an image proposals. These can be of different
+        # shapes
         proposals_per_fpn_level = output_dict["proposals"]
 
         # Mix GT boxes with proposals. This is necessary to stabilize training
@@ -766,31 +896,72 @@ class FasterRCNN(nn.Module):
         # Get batch size from FPN feats:
         num_images = feats_per_fpn_level["p3"].shape[0]
 
-        # Perform RoI-align using FPN features and proposal boxes.
-        roi_feats_per_fpn_level = {
-            level_name: None for level_name in feats_per_fpn_level.keys()
-        }
-        # Get RPN proposals from all levels.
-        for level_name in feats_per_fpn_level.keys():
-            ##################################################################
-            # TODO: Call `torchvision.ops.roi_align`. See its documentation to
-            # properly format input arguments. Use `aligned=True`
-            ##################################################################
-            level_feats = feats_per_fpn_level[level_name]
-            level_props = output_dict["proposals"][level_name]
-            level_stride = self.backbone.fpn_strides[level_name]
+        # NB: see ERRATA below
+        
+#         # Perform RoI-align using FPN features and proposal boxes.
+#         roi_feats_per_fpn_level = {
+#             level_name: None for level_name in feats_per_fpn_level.keys()
+#         }
+#         # Get RPN proposals from all levels.
+#         for level_name in feats_per_fpn_level.keys():
+#             ##################################################################
+#             # TODO: Call `torchvision.ops.roi_align`. See its documentation to
+#             # properly format input arguments. Use `aligned=True`
+#             ##################################################################
+#             level_feats = feats_per_fpn_level[level_name]
+#             level_props = proposals_per_fpn_level[level_name]
+#             level_stride = self.backbone.fpn_strides[level_name]
+            
+#             # spatial_scale=1/level_stride - this is because boxes (level_props) are defined on the original image size,
+#             # while features (level_feats) are define on the image_size/level_stride level. For this reason we need to
+#             # scale image size proposals to the same level dividing them by level_stride. 
+#             roi_feats = torchvision.ops.roi_align(level_feats, level_props, self.roi_size, spatial_scale=1/level_stride, aligned=True)
+            
+#             roi_feats_per_fpn_level[level_name] = roi_feats
 
-            # Replace "pass" statement with your code
-            pass
-            ##################################################################
-            #                         END OF YOUR CODE                       #
-            ##################################################################
+#         # Combine ROI feats across FPN levels, do the same with proposals.
+#         # shape: (batch_size * total_proposals, fpn_channels, roi_h, roi_w)
+#         roi_feats = self._cat_across_fpn_levels(roi_feats_per_fpn_level, dim=0)
 
-            roi_feats_per_fpn_level[level_name] = roi_feats
+        ####################### ERRATA START #######################
+        # problem: RoI-Align we do for each level for all images, so you have
+        # [level1 : 16 images, level2 : 16 images, level3 : 16 images]
+        # while below for matched_gt_boxes have [image1 3 levels, image2 3 levels...]
+        # So because you don't have this correspondence your class predictions
+        # are messed up as there is a misalignment between features and GT labels.
+        # Perhaps because of this misalignment GTs are mapped to background and 
+        # that's why during inference many pictures don't have predicted boxes or 
+        # are completely off because predictions correspond to another image and so on. 
+        roi_feats_imgs = []
+        # Given the above, here we map for each image for all 3 levels, so we have
+        # the correspondence with GT matched_gt_boxes. 
+        # [image 1 3 levels, image 2 3 levels, ...]
+        for _idx in range(num_images):
+            # get all features levels for the image _idx
+            features_per_fpn_level_per_image = {
+                        level_name: feats[_idx]
+                        for level_name, feats in feats_per_fpn_level.items()
+            }
+            # get all proposal levels for the ima_idx
+            proposals_per_fpn_level_per_image = {
+                        level_name: prop[_idx]
+                        for level_name, prop in proposals_per_fpn_level.items()
+                    }
 
-        # Combine ROI feats across FPN levels, do the same with proposals.
-        # shape: (batch_size * total_proposals, fpn_channels, roi_h, roi_w)
-        roi_feats = self._cat_across_fpn_levels(roi_feats_per_fpn_level, dim=0)
+            for l in features_per_fpn_level_per_image:
+                feat_img = features_per_fpn_level_per_image[l]
+                prop_img = proposals_per_fpn_level_per_image[l]
+                roi_feat_l = torchvision.ops.roi_align(feat_img.unsqueeze(0),
+                                                       [prop_img],
+                                                       faster_rcnn.roi_size, 
+                                                       spatial_scale=1/self.backbone.fpn_strides[l], 
+                                                       aligned=True)
+                roi_feats_imgs.append(roi_feat_l)
+                
+        # concatenate all images
+        roi_feats = torch.cat(roi_feats_imgs, dim=0)
+        
+        ####################### ERRATA END #######################
 
         # Obtain classification logits for all ROI features.
         # shape: (batch_size * total_proposals, num_classes)
@@ -809,6 +980,7 @@ class FasterRCNN(nn.Module):
             )
             # fmt: on
 
+        
         ######################################################################
         # Match the RPN proposals with provided GT boxes and append to
         # `matched_gt_boxes`. Use `rcnn_match_anchors_to_gt` with IoU threshold
@@ -820,18 +992,16 @@ class FasterRCNN(nn.Module):
             # Get proposals per image from this dictionary of list of tensors.
             proposals_per_fpn_level_per_image = {
                 level_name: prop[_idx]
-                for level_name, prop in output_dict["proposals"].items()
+                for level_name, prop in proposals_per_fpn_level.items()
             }
             proposals_per_image = self._cat_across_fpn_levels(
                 proposals_per_fpn_level_per_image, dim=0
             )
             gt_boxes_per_image = gt_boxes[_idx]
-            # Replace "pass" statement with your code
-            pass
-        ######################################################################
-        #                           END OF YOUR CODE                         #
-        ######################################################################
-
+            matched_gt_box = rcnn_match_anchors_to_gt(proposals_per_image, gt_boxes_per_image, iou_thresholds=(0.5, 0.5))
+            
+            matched_gt_boxes.append(matched_gt_box)
+            
         # Combine predictions and GT from across all FPN levels.
         matched_gt_boxes = torch.cat(matched_gt_boxes, dim=0)
 
@@ -852,13 +1022,15 @@ class FasterRCNN(nn.Module):
         #      other VC classes have IDs (1-20). Make sure to reverse shift
         #      this during inference, so that model predicts VOC IDs (0-19).
         ######################################################################
-        # Feel free to delete this line: (but keep variable names same)
-        loss_cls = None
-        # Replace "pass" statement with your code
-        pass
-        ######################################################################
-        #                           END OF YOUR CODE                         #
-        ######################################################################
+        
+        fg_idx, bg_idx = sample_rpn_training(matched_gt_boxes, num_images*self.batch_size_per_image , 0.25)
+        selected_pred_cls_logits = torch.cat([pred_cls_logits[fg_idx], pred_cls_logits[bg_idx]], dim=0)
+        selected_gt_cls = torch.cat([matched_gt_boxes[fg_idx], matched_gt_boxes[bg_idx]], dim=0)[:, -1]
+    
+        selected_gt_cls = (selected_gt_cls + 1).to(torch.long)
+        selected_gt_cls = F.one_hot(selected_gt_cls, num_classes = self.num_classes + 1).to(torch.float32)
+        loss_cls = F.cross_entropy(selected_pred_cls_logits, selected_gt_cls)
+        
         return {
             "loss_rpn_obj": output_dict["loss_rpn_obj"],
             "loss_rpn_box": output_dict["loss_rpn_box"],
@@ -924,12 +1096,16 @@ class FasterRCNN(nn.Module):
         # the classifier was supervised in `forward`). Remember to shift the
         # predicted IDs such that model outputs ID (0-19) for 20 VOC classes.
         ######################################################################
-        pred_scores, pred_classes = None, None
-        # Replace "pass" statement with your code
-        pass
-        ######################################################################
-        #                            END OF YOUR CODE                        #
-        ######################################################################
+       
+        pred_scores = torch.softmax(pred_cls_logits, dim=1) # (N, 21)
+        pred_scores, indices = torch.max(pred_scores, dim = 1) # (N, )
+        
+        kept_indices = (pred_scores > test_score_thresh).nonzero()
+        pred_scores = pred_scores[kept_indices].flatten()
+        pred_classes = indices[kept_indices].flatten() - 1
+        
+        pred_boxes = pred_boxes[kept_indices.flatten()]
+        
 
         # STUDENTS: This line depends on your implementation of NMS.
         keep = class_spec_nms(
