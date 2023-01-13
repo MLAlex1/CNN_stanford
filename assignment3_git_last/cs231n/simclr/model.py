@@ -5,6 +5,23 @@ from torchvision.models.resnet import resnet50
 
 
 class Model(nn.Module):
+    """
+    for name, module in resnet50().named_children():
+        print(name)
+    # so we basically remove maxpool and fc
+    conv1
+    bn1
+    relu
+    maxpool
+    layer1
+    layer2
+    layer3
+    layer4
+    avgpool
+    fc
+    # and replace Conv2d(3, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+    # with     nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    """
     def __init__(self, feature_dim=128):
         super(Model, self).__init__()
 

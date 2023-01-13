@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from .contrastive_loss import *
 
-def train(model, data_loader, train_optimizer, epoch, epochs, batch_size=32, temperature=0.5, device='cuda'):
+def train(model, data_loader, train_optimizer, epoch, epochs, batch_size=32, temperature=0.5, device='cpu'):
     """Trains the model defined in ./model.py with one epoch.
     
     Inputs:
@@ -36,11 +36,9 @@ def train(model, data_loader, train_optimizer, epoch, epochs, batch_size=32, tem
         # Run x_i and x_j through the model to get out_left, out_right.              #
         # Then compute the loss using simclr_loss_vectorized.                        #
         ##############################################################################
-        
-        
-        ##############################################################################
-        #                               END OF YOUR CODE                             #
-        ##############################################################################
+        _, out_left = model(x_i)
+        _, out_right = model(x_j)
+        loss = simclr_loss_vectorized(out_left, out_right, temperature, device)
         
         train_optimizer.zero_grad()
         loss.backward()

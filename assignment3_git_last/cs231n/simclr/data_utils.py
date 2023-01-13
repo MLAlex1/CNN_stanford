@@ -25,11 +25,11 @@ def compute_train_transform(seed=123456):
         # Step 1: Randomly resize and crop to 32x32.
         transforms.RandomResizedCrop(32),
         # Step 2: Horizontally flip the image with probability 0.5
+        transforms.RandomHorizontalFlip(0.5),
         # Step 3: With a probability of 0.8, apply color jitter (you can use "color_jitter" defined above.
+        transforms.RandomApply([color_jitter], p=0.8),
         # Step 4: With a probability of 0.2, convert the image to grayscale
-        ##############################################################################
-        #                               END OF YOUR CODE                             #
-        ##############################################################################
+        transforms.RandomGrayscale(p=0.2),
         transforms.ToTensor(),
         transforms.Normalize([0.4914, 0.4822, 0.4465], [0.2023, 0.1994, 0.2010])])
     return train_transform
@@ -57,10 +57,9 @@ class CIFAR10Pair(CIFAR10):
             #                                                                            #
             # Apply self.transform to the image to produce x_i and x_j in the paper #
             ##############################################################################
-            ##############################################################################
-            #                               END OF YOUR CODE                             #
-            ##############################################################################
-
+            x_i = self.transform(img)
+            x_j = self.transform(img)
+            
         if self.target_transform is not None:
             target = self.target_transform(target)
 
