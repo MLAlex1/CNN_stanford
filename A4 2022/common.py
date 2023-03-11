@@ -143,8 +143,8 @@ class DetectorBackboneWithFPN(nn.Module):
         else:
             c5 = backbone_feats["c5"]; c4 = backbone_feats["c4"]; c3 = backbone_feats["c3"]
             # https://jonathan-hui.medium.com/understanding-feature-pyramid-networks-for-object-detection-fpn-45b227b9106c
-            # Remember that c3 contains has higher resolution than c5 (higher resolution - we can more easily recognise smaller objects,
-            # howver it's slower because bigger image thus they are not used for object prediction because of the speed)
+            # Remember that c3 has higher resolution than c5 (higher resolution - we can more easily recognise smaller objects,
+            # however it's slower because bigger image thus they are not used for object prediction because of the speed)
             # but c5 has a higher semantic value, even though low resolution but because it's quicker to predict on them they are used 
             # for object detection. 
             # F.interpolate is used for upsampling - this is to reconstruct higher resolution layers (downsampled layers have low resolution)
@@ -152,12 +152,13 @@ class DetectorBackboneWithFPN(nn.Module):
             # precise after all the downsampling and upsampling. We add lateral connections between reconstructed layers and the corresponding 
             # feature maps to help the detector to predict the location betters. It also acts as skip connections to make training easier
             
-            # We apply a 1×1 convolution filter to reduce C5 channel depth to 256-d to create an intermediate layer (out5). This becomes the first feature map 
+            # We apply a 1×1 convolution filter to reduce C5 channel depth to 256-d (self.out_channels) to create an intermediate layer (out5). This becomes the first feature map 
             # layer used for object prediction. As we go down the top-down path, we upsample the previous layer by 2 using nearest neighbors upsampling (F.interpolate(out5, scale_factor=2)).
             # We again apply a 1×1 convolution to the corresponding feature maps in the bottom-up pathway (self.fpn_params['conv4'](c4)). 
             # Then we add them element-wise (F.interpolate(out5, scale_factor=2) + self.fpn_params['conv4'](c4)). 
             # We apply a 3×3 convolution to all merged layers (self.fpn_params['conv_out5'](out5), self.fpn_params['conv_out4'](out4), self.fpn_params['conv_out3'](out3)). 
-            # This filter reduces the aliasing effect when merged with the upsampled layer.
+            # This filter reduces the aliasing effect when merged with the upsampled layer. Because these layers have padding=1, after 3x3 convolutional layer they preserve
+            # dimensions so no downsampling happens. 
             out5 = self.fpn_params['conv5'](c5)
                    # reconstructed layer + corresponding feature maps
             out4 = F.interpolate(out5, scale_factor=2) + self.fpn_params['conv4'](c4)
@@ -230,7 +231,8 @@ def get_fpn_location_coords(
         rows = rows.repeat(W, 1).t().contiguous().view(-1, 1)
         cols = cols.repeat(H, 1).contiguous().view(-1, 1)
 
-        final = torch.stack([rows, cols], -1).squeeze()
+        final = torch.stack([rows, cols], -1).squeeze() # rows and cols inverted as in the other implementation above
+        # final = torch.stack([cols, rows], -1).squeeze() # same as temp
         location_coords[level_name] = final
     
 #     for level_name, feat_shape in shape_per_fpn_level.items():

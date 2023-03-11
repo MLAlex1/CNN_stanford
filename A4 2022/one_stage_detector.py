@@ -526,6 +526,7 @@ class FCOS(nn.Module):
         ######################################################################
         
         fpn_feats = self.backbone(images)
+        # prediction for each FPN level
         pred_cls_logits, pred_boxreg_deltas, pred_ctr_logits = self.pred_net(fpn_feats)
         
         ######################################################################
@@ -692,6 +693,8 @@ class FCOS(nn.Module):
 
             # Get locations and predictions from a single level.
             # We index predictions by `[0]` to remove batch dimension.
+            # This is because for inference we do it PER image, so 
+            # batch dim is always = 1
             level_locations = locations_per_fpn_level[level_name]
             level_cls_logits = pred_cls_logits[level_name][0]
             level_deltas = pred_boxreg_deltas[level_name][0]
@@ -729,16 +732,13 @@ class FCOS(nn.Module):
                 level_cls_logits.sigmoid_() * level_ctr_logits.sigmoid_()
             )
             # Step 1:
-            # Replace "pass" statement with your code
             vals_conf, idxs_conf = level_pred_scores.max(1)
 
             # Step 2:
-            # Replace "pass" statement with your code
             mask_thr_conf = vals_conf > test_score_thresh
             # vals_conf_thr, idxs_conf_thr = vals_conf[mask_thr_conf], idxs_conf[mask_thr_conf]
 
             # Step 3:
-            # Replace "pass" statement with your code
             level_deltas_thr = level_deltas[mask_thr_conf]
             level_locations_thr = level_locations[mask_thr_conf]
             # transform back into original image size

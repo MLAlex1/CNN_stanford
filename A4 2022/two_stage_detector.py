@@ -781,7 +781,6 @@ class RPN(nn.Module):
             # with lists, not batched tensors.
             proposals_all_levels[level_name] = level_proposals_per_image
         
-        # proposals_all_levels = default_collate(proposals_all_levels)
         return proposals_all_levels
 
     @staticmethod
@@ -876,13 +875,16 @@ class FasterRCNN(nn.Module):
         """
 
         feats_per_fpn_level = self.backbone(images)
+        # output_dict - contains proposals and object and box losses
         output_dict = self.rpn(
             feats_per_fpn_level, self.backbone.fpn_strides, gt_boxes
         )
         
-        # these proposals are a dictionary of lists. Each list
-        # corresponds an image proposals. These can be of different
-        # shapes
+        # these proposals are a dictionary of lists. Each key corresponds to
+        # a level in FPN network while each list in a corresponding key are
+        # image proposals - so first list in first key are the proposals for
+        # the first image for first FPN level. These proposals can be of different
+        # shapes.
         proposals_per_fpn_level = output_dict["proposals"]
 
         # Mix GT boxes with proposals. This is necessary to stabilize training
@@ -947,7 +949,11 @@ class FasterRCNN(nn.Module):
                         level_name: prop[_idx]
                         for level_name, prop in proposals_per_fpn_level.items()
                     }
-
+            
+            # we need to then do it in a loop instead of concatenating across
+            # all levels because each level has different number of RoI features,
+            # e.g. 7x7, 14x14, 28x28 so we cannot concatenate and need to compute
+            # them in a loop and concatenate later. 
             for l in features_per_fpn_level_per_image:
                 feat_img = features_per_fpn_level_per_image[l]
                 prop_img = proposals_per_fpn_level_per_image[l]
